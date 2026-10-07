@@ -19,6 +19,25 @@
 #      else $HOME/<name>), CLAUDE_BIN (default claude).
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:$PATH"
 D="$HOME/.claude-persist"; mkdir -p "$D"
+
+# Resolve the claude binary instead of assuming a path. It was pinned to
+# /usr/local/bin/claude to stop a ~/.local/bin/claude wrapper from recursing
+# into the restart loop -- but the native installer puts claude in
+# ~/.local/bin, so on those boxes the pin made the agent crash-loop forever
+# with "No such file or directory". Found on neuralgrid.
+# Order: explicit override, then the npm/global path, then the user path,
+# then PATH. A wrapper at any of these exec's the real binary, so no recursion.
+resolve_claude() {
+  [ -n "${CLAUDE_BIN:-}" ] && { printf '%s' "$CLAUDE_BIN"; return; }
+  local c
+  for c in /usr/local/bin/claude "$HOME/.local/bin/claude" "$HOME/.npm-global/bin/claude"; do
+    [ -x "$c" ] && { printf '%s' "$c"; return; }
+  done
+  c="$(command -v claude 2>/dev/null)"
+  [ -n "$c" ] && { printf '%s' "$c"; return; }
+  printf 'claude'   # last resort; the loop will log a clear failure
+}
+
 say() { printf '%s\n' "$*"; }
 cmd="${1:-attach}"
 case "$cmd" in attach|stream|start|start-all|stop|status|reset|list|restart|fresh|_loop) shift ;; *) cmd=attach ;; esac
@@ -49,8 +68,8 @@ run_loop() {
       # silent and invisible for 7 minutes. Hand it a short opening task so
       # it announces itself. Override per agent in $D/$N.resumeprompt.
       rp="$(cat "$D/$N.resumeprompt" 2>/dev/null)"
-      [ -n "$rp" ] || rp="You just came back from a restart with your context intact. Briefly: confirm what this node is and that its services are up, announce yourself on the bus if this node is in a tank (cod send all \"<name> is up after reboot\"), then carry on with whatever you were doing."
-      ${CLAUDE_BIN:-/usr/local/bin/claude} --rc --resume "$sid" -n "$N" "$rp"
+      [ -n "$rp" ] || rp="You just came back from a restart with your context intact. Briefly: confirm what this node is and that its services are up, announce yourself on the bus if this node is in a tank, then carry on with whatever you were doing."
+      $(resolve_claude) --rc --resume "$sid" -n "$N" "$rp"
     else
       echo "[claude-persist:$N] new session $sid"
       # A fresh agent with no opening prompt is a dead agent: it sits at the
@@ -60,7 +79,7 @@ run_loop() {
       # survivable. Override per instance in $D/$N.bootprompt.
       bp="$(cat "$D/$N.bootprompt" 2>/dev/null)"
       [ -n "$bp" ] || bp="You are the $N agent on this node, waking with no prior context after a restart or a deliberate context roll. Before acting: read any handoff notes left for you on this machine, say plainly what you are and what this node is for, and ask for what you need rather than guessing. Do not assume you have credentials, network peers, or private data; this node may be a clean public install."
-      ${CLAUDE_BIN:-/usr/local/bin/claude} --rc --session-id "$sid" -n "$N" "$bp"
+      $(resolve_claude) --rc --session-id "$sid" -n "$N" "$bp"
     fi
     echo "[claude-persist:$N] claude exited, restarting in 5s"; sleep 5
   done
@@ -80,13 +99,22 @@ run_loop() {
 ensure() {
   tmux has-session -t "$N" 2>/dev/null && return 0
   cwd_for >/dev/null
-  local inner="CLAUDE_BIN='${CLAUDE_BIN:-/usr/local/bin/claude}' '$0' _loop '$N'"
+  local inner="CLAUDE_BIN='$(resolve_claude)' '$0' _loop '$N'"
   if tmux has-session 2>/dev/null || tmux list-sessions >/dev/null 2>&1; then
     # a server already exists and is already outside this unit's cgroup
     tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
+  elif systemctl --user cat cod-tmux.service >/dev/null 2>&1; then
+    # A real cod-tmux.service exists, so START IT rather than trying to make a
+    # transient unit of the same name — systemd refuses that ("already loaded
+    # or has a fragment file") and the fallback then creates the server inside
+    # whatever scope the caller happens to be in. Observed on neuralgrid: the
+    # server landed in the ssh login session's scope, so it would have died
+    # when that ssh connection closed. Same cgroup trap, new disguise.
+    systemctl --user start cod-tmux.service >/dev/null 2>&1
+    tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
   elif command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     systemd-run --user --quiet --collect \
-      --unit=cod-tmux --description="COD tmux server (holds every agent session)" \
+      --unit=cod-tmux-transient --description="COD tmux server (holds every agent session)" \
       --property=Type=forking --property=KillMode=process --property=RemainAfterExit=yes \
       tmux new-session -d -s "$N" -x 200 -y 50 "$inner" \
     || tmux new-session -d -s "$N" -x 200 -y 50 "$inner"

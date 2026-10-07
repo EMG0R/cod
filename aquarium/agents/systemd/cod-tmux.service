@@ -21,7 +21,16 @@ KillMode=process
 #
 # There is deliberately NO ExecStop. Stopping this unit must not reap the
 # server either; KillMode=process keeps the daemon alive.
-ExecStart=/usr/bin/tmux start-server
+# `tmux start-server` leaves a server with NO sessions, and such a server is
+# short-lived. On the 2026-10-06 reboot test this unit went active, its empty
+# server went away, and cod-agents then created the real server inside ITS
+# cgroup — the exact failure this unit exists to prevent.
+#
+# A permanent do-nothing session pins the server here instead. It costs one
+# sleeping process, and it is what keeps every agent session created later in
+# THIS unit's cgroup rather than in whichever unit happened to ask first.
+ExecStart=/usr/bin/tmux new-session -d -s _cod_hold -x 80 -y 24 "exec sleep infinity"
+ExecStartPost=/usr/bin/tmux has-session -t _cod_hold
 
 [Install]
 WantedBy=default.target
