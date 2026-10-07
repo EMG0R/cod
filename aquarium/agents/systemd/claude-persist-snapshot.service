@@ -1,0 +1,7 @@
+[Unit]
+Description=claude-persist snapshot (record live Claude sessions in the registry)
+
+[Service]
+Type=oneshot
+# No ExecStop, ever.
+ExecStart=%h/.local/bin/claude-persist snapshot

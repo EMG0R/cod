@@ -8,9 +8,10 @@ with no human typing anything.
 
 | file | what it does |
 |---|---|
-| `claude-persist` | starts/resumes an agent in tmux; `start-all` discovers every registered agent |
+| `claude-persist` | starts/resumes an agent in tmux; `start-all`/`boot` bring back every known agent |
 | `systemd/cod-tmux.service` | **owns the tmux server** |
 | `systemd/cod-agents.service` | calls `claude-persist start-all` at boot |
+| `systemd/claude-persist-snapshot.{service,timer}` | every 2 min, records the sessions that are actually live |
 
 ## Install
 
@@ -18,10 +19,25 @@ with no human typing anything.
     install -m 644 systemd/*.service ~/.config/systemd/user/
     systemctl --user daemon-reload
     systemctl --user enable cod-tmux.service cod-agents.service
+    systemctl --user enable --now claude-persist-snapshot.timer
     loginctl enable-linger "$USER"
 
 Linger matters: without it the user manager stops at logout and every agent
 dies with it.
+
+## The registry (what exists)
+
+`claude-persist snapshot` reads `~/.claude/sessions/*.json`, keeps interactive
+sessions whose pid is alive, and records each as `~/.claude-persist/up/<name>`
+(`session-id<TAB>cwd<TAB>title`; name = its tmux session, else `claude-<sid8>`).
+So a session a human started by hand is brought back too, not just agents
+claude-persist launched. `start-all` resumes the union of the registry and the
+`*.sid` files. `snapshot --add-only` never drops entries. An entry is only
+dropped when it is neither live nor in a running tmux session, so a snapshot
+that fires right after boot cannot empty the registry.
+
+Opening prompts are per node and never shipped: `~/.claude-persist/<name>.bootprompt`,
+`<name>.resumeprompt`, or node-wide `bootprompt` / `resumeprompt`.
 
 ## How resume works
 

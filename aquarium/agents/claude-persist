@@ -1,31 +1,48 @@
 #!/bin/bash
-# claude-persist — Claude Code sessions on this Pi that survive SSH drops AND
-# reboots, with their own context restored. Every instance runs `claude --rc`
-# (Remote Control: visible in the app / COD bus) inside a detached tmux session,
-# restarted if it exits. Started at boot by claude-rc.service (user unit, linger).
+# claude-persist -- Claude Code sessions that survive SSH drops AND reboots,
+# with their own context restored. Every agent runs `claude --rc` (Remote
+# Control) inside a detached tmux session and is restarted if it exits.
 #
-# Many instances can coexist: each has a NAME, its own tmux session, its own
-# cwd, and its own pinned session id in ~/.claude-persist/<name>.sid. On every
-# (re)start an instance resumes ITS session id if the transcript exists, else
-# starts a new session pinned to that id. Instances never resume each other.
+# WHAT EXISTS is decided by a snapshot registry: ~/.claude-persist/up/<name>
+# (one line: session-id <TAB> cwd <TAB> title), rebuilt from the sessions that
+# are actually LIVE (~/.claude/sessions/*.json, kind=interactive, pid alive).
+# That includes sessions a human started by hand. Agents started by
+# claude-persist itself are also remembered in ~/.claude-persist/<name>.sid.
+# HOW an agent starts is per-name: its own pinned session id, resumed if the
+# transcript exists, else a new session pinned to that id. Agents never
+# resume each other.
 #
-#   claude-persist [name]            attach (creates if missing)   default name: claude
-#   claude-persist start [name]      ensure running, stay detached
-#   claude-persist stop [name]       kill it (its session id is kept)
+#   claude-persist [name]          attach (creates if missing); default name: claude
+#   claude-persist start [name]    ensure running, stay detached
+#   claude-persist start-all       bring back EVERY known agent (registry + .sid files)
+#   claude-persist boot            same as start-all
+#   claude-persist snapshot [--add-only]
+#                                  rebuild the registry from live sessions.
+#                                  --add-only never drops entries (use at shutdown).
+#                                  Meant to run from a timer every ~2 minutes.
+#   claude-persist stop [name]     kill the tmux session (session id is kept)
 #   claude-persist status [name]
-#   claude-persist list              all known instances
-#   claude-persist reset [name]      forget the pinned session id (next start = fresh)
-# Env: CLAUDE_PERSIST_CWD (cwd for a new instance; default $HOME for "claude",
-#      else $HOME/<name>), CLAUDE_BIN (default claude).
+#   claude-persist list            name state activity cwd session-id title (tab-separated)
+#   claude-persist restart [name]  bounce only the inner claude; same context
+#   claude-persist fresh [name]    bounce and drop the pinned id (new context)
+#   claude-persist reset [name]    forget the pinned id (next start = fresh)
+#   claude-persist stream <name>   safe viewer attach: never creates, grouped session
+#
+# Env: CLAUDE_PERSIST_CWD (cwd for a new agent; default $HOME for "claude",
+#      else $HOME/<name>), CLAUDE_BIN (override the claude binary).
+# Per-node prompts (never shipped), in ~/.claude-persist/:
+#      <name>.bootprompt  <name>.resumeprompt   (per agent)
+#      bootprompt         resumeprompt          (node-wide fallback)
+# Run from units that have NO ExecStop of any kind.
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:$PATH"
-D="$HOME/.claude-persist"; mkdir -p "$D"
+# An auto-update once truncated claude to 0 bytes and crash-looped every agent
+# on a node. The agent loop must never self-update underneath itself.
+export DISABLE_AUTOUPDATER=1
+D="$HOME/.claude-persist"; U="$D/up"; mkdir -p "$D" "$U" "$HOME/.local/share"
 
-# Resolve the claude binary instead of assuming a path. It was pinned to
-# /usr/local/bin/claude to stop a ~/.local/bin/claude wrapper from recursing
-# into the restart loop -- but the native installer puts claude in
-# ~/.local/bin, so on those boxes the pin made the agent crash-loop forever
-# with "No such file or directory". Found on neuralgrid.
-# Order: explicit override, then the npm/global path, then the user path,
+# Resolve the claude binary instead of assuming a path. A pin to
+# /usr/local/bin/claude crash-looped a node where the native installer put the
+# binary in ~/.local/bin. Order: explicit override, then known install paths,
 # then PATH. A wrapper at any of these exec's the real binary, so no recursion.
 resolve_claude() {
   [ -n "${CLAUDE_BIN:-}" ] && { printf '%s' "$CLAUDE_BIN"; return; }
@@ -39,21 +56,42 @@ resolve_claude() {
 }
 
 say() { printf '%s\n' "$*"; }
+log() { echo "$(date -Is) $*" >> "$HOME/.local/share/claude-persist.log"; }
 cmd="${1:-attach}"
-case "$cmd" in -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;; esac
-case "$cmd" in attach|stream|start|start-all|stop|status|reset|list|restart|fresh|_loop) shift ;; *) cmd=attach ;; esac
-N="${1:-claude}"
-# Reject anything flag-shaped as a name. `claude-persist --help` previously
-# fell through to the name slot and REGISTERED an agent called "--help" with a
-# cwd of ~/--help. A typo must not create an agent.
-case "$N" in -*) echo "not an agent name: $N (did you mean a subcommand?)" >&2; exit 2 ;; esac
-[[ "$N" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad name: $N" >&2; exit 2; }
+case "$cmd" in -h|--help|help) sed -n '2,/^export PATH/p' "$0" | sed '$d'; exit 0 ;; esac
+case "$cmd" in
+  attach|stream|start|start-all|boot|snapshot|stop|status|reset|list|restart|fresh|_loop) shift ;;
+  *) cmd=attach ;;
+esac
 
-cwd_for() {  # remembered per instance; first start fixes it
+# Commands that take no agent name never touch N, so flags like --add-only are
+# not mistaken for one.
+case "$cmd" in
+  start-all|boot|snapshot|list) N="" ;;
+  *)
+    N="${1:-claude}"
+    # A flag-shaped argument must never become an agent name: `claude-persist
+    # --help` once registered an agent called "--help" with a cwd of ~/--help.
+    case "$N" in -*) echo "not an agent name: $N (did you mean a subcommand? see --help)" >&2; exit 2 ;; esac
+    [[ "$N" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { echo "bad name: $N" >&2; exit 2; }
+    # _cod_hold is the internal tmux holder, never an agent.
+    [ "$N" = _cod_hold ] && { echo "refusing: _cod_hold is the internal tmux holder, not an agent" >&2; exit 2; }
+    ;;
+esac
+
+cwd_for() {  # remembered per agent; first start fixes it
   if [ -s "$D/$N.cwd" ]; then cat "$D/$N.cwd"; return; fi
   local c="${CLAUDE_PERSIST_CWD:-}"
   [ -z "$c" ] && { [ "$N" = claude ] && c="$HOME" || c="$HOME/$N"; }
   mkdir -p "$c"; echo "$c" > "$D/$N.cwd"; echo "$c"
+}
+
+title_for() { local t; t="$(cat "$D/$N.title" 2>/dev/null)"; printf '%s' "${t:-$N}"; }
+
+prompt_for() {  # $1 = bootprompt|resumeprompt; per-agent, then node-wide, else empty
+  local p; p="$(cat "$D/$N.$1" 2>/dev/null)"
+  [ -n "$p" ] || p="$(cat "$D/$1" 2>/dev/null)"
+  printf '%s' "$p"
 }
 
 # runs inside tmux, loops forever
@@ -63,154 +101,197 @@ run_loop() {
   while true; do
     [ -s "$D/$N.sid" ] || cat /proc/sys/kernel/random/uuid > "$D/$N.sid"
     sid="$(cat "$D/$N.sid")"
+    title="$(title_for)"
     if ls "$HOME"/.claude/projects/*/"$sid".jsonl >/dev/null 2>&1; then
       echo "[claude-persist:$N] resuming $sid"
       # -n matters: without it the app shows a derived name instead of this
-      # instance's name, and you cannot tell which agent you are looking at.
-      # A resumed agent that is handed nothing does nothing, so it never
-      # registers activity and does not appear in the app until a human or
-      # another agent speaks to it. After the 2026-10-06 reboot this one sat
-      # silent and invisible for 7 minutes. Hand it a short opening task so
-      # it announces itself. Override per agent in $D/$N.resumeprompt.
-      rp="$(cat "$D/$N.resumeprompt" 2>/dev/null)"
-      [ -n "$rp" ] || rp="You just came back from a restart with your context intact. Briefly: confirm what this node is and that its services are up, announce yourself on the bus if this node is in a tank, then carry on with whatever you were doing."
-      $(resolve_claude) --rc --resume "$sid" -n "$(cat "$D/$N.title" 2>/dev/null || echo "$N")" "$rp"
+      # agent's name. A resumed agent that is handed nothing does nothing, so
+      # it never registers activity and stays invisible in the app until
+      # someone speaks to it; hand it a short opening task.
+      rp="$(prompt_for resumeprompt)"
+      [ -n "$rp" ] || rp="You just came back from a restart with your context intact. Briefly tell the user you are back and note anything that looks wrong, then carry on with what you were doing."
+      "$(resolve_claude)" --rc --resume "$sid" -n "$title" "$rp"
     else
       echo "[claude-persist:$N] new session $sid"
-      # A fresh agent with no opening prompt is a dead agent: it sits at the
-      # prompt forever with nobody to tell it to read its own handoff. That
-      # happened on 2026-10-05 -- a context roll at the 09:00 reboot left this
-      # agent idle for 7.7 h. The boot prompt is what makes a rolled context
-      # survivable. Override per instance in $D/$N.bootprompt.
-      bp="$(cat "$D/$N.bootprompt" 2>/dev/null)"
-      [ -n "$bp" ] || bp="You are the $N agent on this node, waking with no prior context after a restart or a deliberate context roll. Before acting: read any handoff notes left for you on this machine, say plainly what you are and what this node is for, and ask for what you need rather than guessing. Do not assume you have credentials, network peers, or private data; this node may be a clean public install."
-      $(resolve_claude) --rc --session-id "$sid" -n "$(cat "$D/$N.title" 2>/dev/null || echo "$N")" "$bp"
+      # A fresh agent with no opening prompt sits at the prompt forever. The
+      # boot prompt is what makes a rolled context survivable.
+      bp="$(prompt_for bootprompt)"
+      [ -n "$bp" ] || bp="You are the $N agent on $(hostname), waking with no prior context after a restart or a deliberate context roll. Read whatever handoff notes or memory you have for this machine, then tell the user in a few lines what you are and what state things are in."
+      "$(resolve_claude)" --rc --session-id "$sid" -n "$title" "$bp"
     fi
     echo "[claude-persist:$N] claude exited, restarting in 5s"; sleep 5
   done
 }
 [ "$cmd" = _loop ] && { run_loop "$N"; exit; }
 
-# The tmux SERVER must not live inside whatever service happened to start it.
+# The tmux SERVER must not live inside whatever unit happened to start it.
 # There is ONE tmux server per socket, shared by every session, so its cgroup
-# is decided by whoever created it first. Twice on 2026-10-06 the server was
-# created inside the agent-resume unit's cgroup, and then stopping, restarting
-# or renaming that unit killed the server and every live agent with it.
-#
-# So: if no server is running yet, start it in its OWN transient unit
-# (cod-tmux.service) with KillMode=process. After that the unit that calls
-# start-all is irrelevant to the agents' survival -- it only ever sends
+# is decided by whoever created it first. If that was the resume unit, then
+# stopping, restarting or renaming that unit killed the server and every live
+# agent with it. So the server lives in cod-tmux.service (pinned open by a
+# _cod_hold session), and the unit that calls start-all only ever sends
 # new-session to an already-independent server.
 ensure() {
-  tmux has-session -t "$N" 2>/dev/null && return 0
+  tmux has-session -t "=$N" 2>/dev/null && return 0
   cwd_for >/dev/null
   local inner="CLAUDE_BIN='$(resolve_claude)' '$0' _loop '$N'"
   if tmux has-session 2>/dev/null || tmux list-sessions >/dev/null 2>&1; then
     # a server already exists and is already outside this unit's cgroup
     tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
   elif systemctl --user cat cod-tmux.service >/dev/null 2>&1; then
-    # A real cod-tmux.service exists, so START IT rather than trying to make a
-    # transient unit of the same name — systemd refuses that ("already loaded
-    # or has a fragment file") and the fallback then creates the server inside
-    # whatever scope the caller happens to be in. Observed on neuralgrid: the
-    # server landed in the ssh login session's scope, so it would have died
-    # when that ssh connection closed. Same cgroup trap, new disguise.
+    # A real cod-tmux.service exists, so START IT rather than making a
+    # transient unit of the same name: systemd refuses that ("already loaded
+    # or has a fragment file") and the fallback would create the server inside
+    # the caller's scope (an ssh login session), dying when that closes.
     systemctl --user start cod-tmux.service >/dev/null 2>&1
     tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
   elif command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     systemd-run --user --quiet --collect \
-      --unit=cod-tmux-transient --description="COD tmux server (holds every agent session)" \
+      --unit=cod-tmux-transient --description="tmux server (holds every agent session)" \
       --property=Type=forking --property=KillMode=process --property=RemainAfterExit=yes \
       tmux new-session -d -s "$N" -x 200 -y 50 "$inner" \
     || tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
   else
     tmux new-session -d -s "$N" -x 200 -y 50 "$inner"
   fi
+  log "start $N"
 }
-# start-all — bring back EVERY registered agent, discovered not hardcoded.
-# A reboot should restore whatever was running on this box, whatever it is
-# called. Hardcoding one session name means a second agent silently never
-# comes back, and nobody notices until they need it.
-if [ "$cmd" = start-all ]; then
-  found=0
-  for f in "$D"/*.sid; do
-    [ -e "$f" ] || continue
-    N="$(basename "$f" .sid)"
-    [[ "$N" =~ ^[A-Za-z0-9_.-]+$ ]] || continue
-    found=$((found+1))
-    if tmux has-session -t "$N" 2>/dev/null; then
-      say "= $N already running"
-    else
-      say "+ starting $N"
-      ensure
-    fi
+
+# has_transcript <sid>
+has_transcript() { ls "$HOME"/.claude/projects/*/"$1".jsonl >/dev/null 2>&1; }
+
+# snapshot -- rebuild the registry from LIVE interactive sessions.
+snapshot() {  # $1 = --add-only or empty
+  local tmp n e sid cwd title; tmp=$(mktemp -d)
+  python3 - "$tmp" <<'PY'
+import json, glob, os, sys, re
+out = sys.argv[1]
+for f in glob.glob(os.path.expanduser('~/.claude/sessions/*.json')):
+    try: d = json.load(open(f))
+    except Exception: continue
+    pid = d.get('pid'); sid = d.get('sessionId')
+    if not pid or not sid or d.get('kind') != 'interactive': continue
+    try: os.kill(int(pid), 0)
+    except Exception: continue                      # not alive
+    tm = (d.get('tmux') or '').split(':')[0]
+    ok = re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', tm or '') and tm != '_cod_hold'
+    name = tm if ok else 'claude-' + sid[:8]
+    title = (d.get('name') or name).replace('\t', ' ').replace('\n', ' ')
+    cwd = (d.get('cwd') or os.path.expanduser('~')).replace('\t', ' ').replace('\n', ' ')
+    open(os.path.join(out, name), 'w').write(f"{sid}\t{cwd}\t{title}\n")
+PY
+  if [ "$1" != --add-only ]; then
+    # Never wipe the registry on a quiet moment: right after boot the timer can
+    # fire before agents are back up. Only drop an entry that is neither live
+    # nor sitting in a running tmux session.
+    for e in "$U"/*; do [ -e "$e" ] || continue
+      n=$(basename "$e")
+      [ -e "$tmp/$n" ] && continue
+      tmux has-session -t "=$n" 2>/dev/null && continue
+      rm -f "${e:?}"; log "snapshot drop $n"
+    done
+  fi
+  for e in "$tmp"/*; do [ -e "$e" ] || continue
+    n=$(basename "$e")
+    cmp -s "$e" "$U/$n" || { cp "$e" "$U/$n"; log "snapshot up $n"; }
+    IFS=$'\t' read -r sid cwd title < "$e"
+    echo "$sid" > "$D/$n.sid"; echo "$cwd" > "$D/$n.cwd"; printf '%s' "$title" > "$D/$n.title"
   done
-  [ "$found" -gt 0 ] || say "no registered agents in $D (nothing to start)"
-  exit 0
-fi
+  rm -rf "${tmp:?}"
+}
+
+# all_names -- the union: every registry entry plus every pinned-id file.
+all_names() {
+  { for e in "$U"/*; do [ -e "$e" ] && basename "$e"; done
+    for f in "$D"/*.sid; do [ -e "$f" ] && basename "$f" .sid; done
+  } | sort -u | while read -r n; do
+    [ "$n" = _cod_hold ] && continue
+    [[ "$n" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] && echo "$n"
+  done
+}
+
+# adopt_registry <name> -- load a registry entry into the per-name files.
+# The registry says what was LIVE; keep an existing pin only when the
+# registry's session has no transcript left to resume and the pin does.
+adopt_registry() {
+  local n="$1" sid cwd title cur
+  [ -s "$U/$n" ] || return 0
+  IFS=$'\t' read -r sid cwd title < "$U/$n"
+  [ -n "$sid" ] || return 0
+  cur="$(cat "$D/$n.sid" 2>/dev/null)"
+  if [ -n "$cur" ] && [ "$cur" != "$sid" ] && ! has_transcript "$sid" && has_transcript "$cur"; then :
+  else echo "$sid" > "$D/$n.sid"; fi
+  [ -n "$cwd" ] && [ -d "$cwd" ] && echo "$cwd" > "$D/$n.cwd"
+  [ -n "$title" ] && printf '%s' "$title" > "$D/$n.title"
+}
+
+forget() {  # drop pin and/or registry entry for $N
+  [ -n "${N:-}" ] || return 1
+  [ "$1" = pin ] && rm -f "${D:?}/${N:?}.sid"
+  rm -f "${U:?}/${N:?}"
+}
 
 case "$cmd" in
+  snapshot) snapshot "${1:-}" ;;
+  # start-all / boot -- bring back EVERY known agent, discovered not hardcoded.
+  start-all|boot)
+    found=0
+    for n in $(all_names); do
+      N="$n"; found=$((found+1))
+      if tmux has-session -t "=$N" 2>/dev/null; then
+        say "= $N already running"
+      else
+        adopt_registry "$N"
+        say "+ starting $N"
+        ensure
+      fi
+    done
+    [ "$found" -gt 0 ] || say "no registered agents in $D (nothing to start)"
+    ;;
   start)  ensure ;;
-  stop)   tmux kill-session -t "$N" 2>/dev/null ;;
-  status) tmux has-session -t "$N" 2>/dev/null && { echo "$N running (sid $(cat "$D/$N.sid" 2>/dev/null))"; tmux capture-pane -pt "$N" | grep -v "^ *$" | tail -5; } || echo "$N stopped" ;;
-  # list — STABLE column order, documented, same on every node:
-  #   name <TAB> state <TAB> activity <TAB> cwd <TAB> session-id <TAB> display
-  # `activity` is active|idle: idle means the transcript contains no user turns,
-  # i.e. nobody has ever typed into this agent. A viewer (the COD app) streams
-  # only active ones, otherwise every freshly-registered agent becomes an empty
-  # window. Columns were previously ordered differently on different nodes,
-  # which forced consumers to guess by shape; don't reorder these again.
+  stop)   tmux kill-session -t "=$N" 2>/dev/null; rm -f "${U:?}/${N:?}"; log "stop $N" ;;
+  status) tmux has-session -t "=$N" 2>/dev/null && { echo "$N running (sid $(cat "$D/$N.sid" 2>/dev/null))"; tmux capture-pane -pt "=$N" | grep -v "^ *$" | tail -5; } || echo "$N stopped" ;;
+  # list -- STABLE column order, same on every node:
+  #   name <TAB> state <TAB> activity <TAB> cwd <TAB> session-id <TAB> title
+  # `activity` is "<active|idle>:<user-turn-count>". A boot prompt injected by
+  # claude-persist and a message delivered into the pane both appear as user
+  # turns, so this cannot tell "a human typed here" from "something was
+  # injected": idle means <=1 turn. Threshold the COUNT yourself. Do not
+  # reorder these columns.
   list)
-    for f in "$D"/*.sid; do
-      [ -e "$f" ] || continue
-      n=$(basename "$f" .sid); [ "$n" = _cod_hold ] && continue
-      sid=$(cat "$f" 2>/dev/null)
-      st=$(tmux has-session -t "$n" 2>/dev/null && echo running || echo stopped)
-      cw=$(cat "$D/$n.cwd" 2>/dev/null)
-      dn=$(cat "$D/$n.title" 2>/dev/null); [ -n "$dn" ] || dn="$n"
-      # activity: "<label>:<user-turn-count>", e.g. active:448 / idle:1
-      # HONEST LIMITATION, read this before trusting the label: a boot prompt
-      # injected by claude-persist, and a bus message delivered into the pane,
-      # both appear in the transcript as user turns. So this CANNOT distinguish
-      # "a human typed here" from "something was injected". idle means <=1 turn
-      # (just the boot prompt). The COUNT is the useful signal -- threshold it
-      # yourself rather than trusting a boolean I cannot compute correctly.
+    for n in $(all_names); do
+      sid=$(cat "$D/$n.sid" 2>/dev/null); cw=$(cat "$D/$n.cwd" 2>/dev/null); dn=$(cat "$D/$n.title" 2>/dev/null)
+      if [ -z "$sid" ] && [ -s "$U/$n" ]; then IFS=$'\t' read -r sid rcw rdn < "$U/$n"; [ -n "$cw" ] || cw="$rcw"; [ -n "$dn" ] || dn="$rdn"; fi
+      [ -n "$dn" ] || dn="$n"
+      st=$(tmux has-session -t "=$n" 2>/dev/null && echo running || echo stopped)
       turns=0
       for t in "$HOME"/.claude/projects/*/"$sid".jsonl; do
         [ -e "$t" ] || continue
-        turns=$(grep -c '"type":"user"' "$t" 2>/dev/null || echo 0)
-        break
+        turns=$(grep -c '"type":"user"' "$t" 2>/dev/null); break
       done
-      if [ "${turns:-0}" -le 1 ]; then act="idle:${turns:-0}"; else act="active:$turns"; fi
+      turns=${turns:-0}
+      if [ "$turns" -le 1 ]; then act="idle:$turns"; else act="active:$turns"; fi
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$act" "$cw" "$sid" "$dn"
     done ;;
-  reset)  rm -f "$D/$N.sid" ;;
-  # restart — bounce ONLY the inner claude, never the tmux session. Killing the
-  # session would drop the agent the Claude app is remote-controlling. The sid
-  # is kept, so the loop relaunches in ~5s and RESUMES the same context.
+  reset)  forget pin ;;
+  # restart -- bounce ONLY the inner claude, never the tmux session; killing
+  # the session would drop the agent a remote app is controlling. The sid is
+  # kept, so the loop relaunches in ~5s and RESUMES the same context.
   restart|fresh)
     ensure
-    [ "$cmd" = fresh ] && rm -f "$D/$N.sid"   # drop the pin => new context
-    pane=$(tmux display-message -p -t "$N":0 '#{pane_pid}' 2>/dev/null)
+    [ "$cmd" = fresh ] && forget pin   # drop the pin => new context
+    pane=$(tmux display-message -p -t "=$N":0 '#{pane_pid}' 2>/dev/null)
     [ -n "$pane" ] && pkill -P "$pane" 2>/dev/null
-    echo "$(date -Is) $cmd $N (pane ${pane:-none})" >> "$HOME/.local/share/claude-persist.log"
+    log "$cmd $N (pane ${pane:-none})"
     ;;
-  attach) ensure; exec tmux attach -t "$N" ;;
-  # stream — what an external viewer (the COD app) should call.
-  # Differs from `attach` in three ways that matter:
-  #   1. It NEVER creates. `attach` calls ensure(), so a viewer attaching to a
-  #      typo or a dead agent would silently spawn a new agent. A viewer must
-  #      not be able to create agents.
-  #   2. It joins as a GROUPED session (`new-session -t`), so each viewer gets
-  #      its own size. Plain `attach` clamps the window to the smallest client,
-  #      so one phone viewing would shrink the agent's view for everybody.
-  #   3. It refuses the internal holder session.
+  attach) ensure; exec tmux attach -t "=$N" ;;
+  # stream -- what an external viewer should call. Unlike `attach` it NEVER
+  # creates (a typo must not spawn an agent), joins as a GROUPED session so
+  # each viewer gets its own size, and refuses _cod_hold (checked above).
   stream)
-    case "$N" in _cod_hold) echo "refusing: _cod_hold is the internal tmux holder, not an agent" >&2; exit 2 ;; esac
-    tmux has-session -t "$N" 2>/dev/null || { echo "no live agent session '$N' on $(hostname)" >&2; exit 1; }
-    # No destroy-unattached: if that option ever landed on the ORIGINAL
-    # session instead of the viewer's, detaching would kill a live agent.
-    # An orphaned viewer session is harmless clutter; a dead agent is not.
-    exec tmux new-session -A -t "$N"
+    tmux has-session -t "=$N" 2>/dev/null || { echo "no live agent session '$N' on $(hostname)" >&2; exit 1; }
+    # No destroy-unattached: if it landed on the ORIGINAL session, detaching
+    # would kill a live agent. An orphaned viewer session is harmless.
+    exec tmux new-session -A -t "=$N"
     ;;
 esac
