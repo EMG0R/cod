@@ -168,12 +168,20 @@ case "$cmd" in
       st=$(tmux has-session -t "$n" 2>/dev/null && echo running || echo stopped)
       cw=$(cat "$D/$n.cwd" 2>/dev/null)
       dn=$(cat "$D/$n.title" 2>/dev/null); [ -n "$dn" ] || dn="$n"
-      act=idle
+      # activity: "<label>:<user-turn-count>", e.g. active:448 / idle:1
+      # HONEST LIMITATION, read this before trusting the label: a boot prompt
+      # injected by claude-persist, and a bus message delivered into the pane,
+      # both appear in the transcript as user turns. So this CANNOT distinguish
+      # "a human typed here" from "something was injected". idle means <=1 turn
+      # (just the boot prompt). The COUNT is the useful signal -- threshold it
+      # yourself rather than trusting a boolean I cannot compute correctly.
+      turns=0
       for t in "$HOME"/.claude/projects/*/"$sid".jsonl; do
         [ -e "$t" ] || continue
-        grep -qm1 '"type":"user"' "$t" 2>/dev/null && act=active
+        turns=$(grep -c '"type":"user"' "$t" 2>/dev/null || echo 0)
         break
       done
+      if [ "${turns:-0}" -le 1 ]; then act="idle:${turns:-0}"; else act="active:$turns"; fi
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$act" "$cw" "$sid" "$dn"
     done ;;
   reset)  rm -f "$D/$N.sid" ;;
