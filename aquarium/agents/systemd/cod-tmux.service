@@ -1,0 +1,27 @@
+[Unit]
+Description=COD tmux server — holds every agent session on this Pi
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+
+# WHY THIS UNIT EXISTS AT ALL.
+# There is ONE tmux server per socket and every agent session lives inside it,
+# so the server's cgroup is decided by whichever unit happened to start it
+# first. On 2026-10-06 that was the agent-resume unit, and the live agent died
+# TWICE in one day: once when a superseded unit's ExecStop fired, and once when
+# that unit was renamed. Both times the agent was collateral damage of a
+# lifecycle action on a unit that merely *started* it.
+#
+# Owning the server here fixes that by construction. cod-agents.service only
+# ever sends `new-session` to a server that is already independent of it, so
+# stopping, restarting or renaming cod-agents cannot kill an agent.
+#
+# There is deliberately NO ExecStop. Stopping this unit must not reap the
+# server either; KillMode=process keeps the daemon alive.
+ExecStart=/usr/bin/tmux start-server
+
+[Install]
+WantedBy=default.target

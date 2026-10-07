@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""cod — client for an aquarium hub. Copy this to any node; stdlib only.
+
+  cod token [--ttl SECONDS]       mint a bearer token from the active hub
+                                   secret (run this on the hub machine)
+  cod send <to> <text...>         send a message
+  cod recv [--since N] [--wait S] read messages addressed to this node
+  cod listen                      long-poll forever, print as they arrive
+  cod health                      is the hub up
+  cod nodes|ssh|scp               optional, need COD_MESH_DIR (see README)
+
+Config, in order of precedence: flags, env, ~/.cod-bus.conf (ini-less, k=v).
+  COD_BUS_URL   default http://127.0.0.1:8798   (this machine's hub)
+  COD_BUS_TOKEN bearer token, minted with `cod token`
+  COD_BUS_NODE  this node's id, default this machine's hostname
+  COD_BUS_STATE where `recv` remembers its position (default ~/.cod-bus.since)
+  COD_BUS_DELIVER  e.g. tmux:agent -- type arriving messages into that session
+A state file ~/.cod-bus.since remembers where you were, so `recv` and `listen`
+do not replay what you already read.
+"""
+import base64, hashlib, hmac, json, os, sys, time, urllib.error, urllib.request
+
+CONF = os.path.expanduser("~/.cod-bus.conf")
+SINCE_FILE = os.path.expanduser(os.environ.get("COD_BUS_STATE", "~/.cod-bus.since"))
+
+
+def cfg(key, default=None):
+    v = os.environ.get(key)
+    if v:
+        return v
+    try:
+        for line in open(CONF):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, val = line.partition("=")
+                if k.strip() == key:
+                    return val.strip()
+    except FileNotFoundError:
+        pass
+    return default
+
+
+URL = (cfg("COD_BUS_URL", "http://127.0.0.1:8798") or "").rstrip("/")
+TOKEN = cfg("COD_BUS_TOKEN", "")
+NODE = cfg("COD_BUS_NODE", os.uname().nodename)
+
+
+def call(method, path, body=None, timeout=60):
+    req = urllib.request.Request(URL + path, method=method)
+    if TOKEN:
+        req.add_header("Authorization", "Bearer " + TOKEN)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:200]
+        if e.code == 401:
+            sys.exit("401 — bad or expired token. Set COD_BUS_TOKEN (see `cod token`).")
+        sys.exit("HTTP %s: %s" % (e.code, detail))
+    except Exception as e:
+        sys.exit("cannot reach %s: %s" % (URL, e))
+
+
+def get_since():
+    try:
+        return int(open(SINCE_FILE).read().strip())
+    except Exception:
+        return 0
+
+
+def set_since(n):
+    try:
+        open(SINCE_FILE, "w").write(str(n))
+    except Exception:
+        pass
+
+
+def show(m):
+    t = time.strftime("%H:%M:%S", time.localtime(m.get("ts", 0)))
+    print("[%s] %s -> %s: %s" % (t, m.get("from"), m.get("to"), m.get("body")))
+
+
+def deliver(m, spec):
+    """Type a message into this node's agent session.
+
+    The hub does this for its own node because the agent lives there; every
+    other node delivers to itself, here. `spec` is "tmux:<session>". Never let
+    a delivery failure kill the listener -- the message is already on the hub.
+    """
+    import re, subprocess
+    if not spec or not spec.startswith("tmux:"):
+        return
+    sess = spec.split(":", 1)[1]
+    try:
+        if subprocess.run(["tmux", "has-session", "-t", sess],
+                          capture_output=True).returncode != 0:
+            return
+        text = "[COD bus] from %s: %s" % (m.get("from", "?"), m.get("body", ""))
+        text = re.sub(r"\s+", " ", text).strip()[:4000]
+        subprocess.run(["tmux", "send-keys", "-t", sess, "-l", text],
+                       capture_output=True, timeout=5)
+        time.sleep(0.25)
+        subprocess.run(["tmux", "send-keys", "-t", sess, "Enter"],
+                       capture_output=True, timeout=5)
+    except Exception as e:
+        print("deliver failed: %s" % e, file=sys.stderr)
+
+
+def cmd_token(argv):
+    """Mint a bearer token from whichever hub secret is active.
+
+    Reads the same files the hub itself reads: the standalone secret at
+    COD_HUB_SECRET_FILE (default ~/.cod/hub_secret), generating nothing --
+    if it doesn't exist yet, run the hub once first so it can create it. If
+    COD_AUTH_ADAPTER_CONFIG is set and readable, that secret is used instead,
+    since the hub accepts both and this keeps tokens interchangeable with
+    whatever else is minting them.
+    """
+    ttl = 365 * 24 * 3600
+    if "--ttl" in argv:
+        ttl = int(argv[argv.index("--ttl") + 1])
+    secret = None
+    adapter_cfg = cfg("COD_AUTH_ADAPTER_CONFIG", "")
+    if adapter_cfg:
+        try:
+            with open(adapter_cfg) as f:
+                secret = json.load(f).get("token_secret")
+        except Exception:
+            secret = None
+    if not secret:
+        secret_file = cfg("COD_HUB_SECRET_FILE", os.path.expanduser("~/.cod/hub_secret"))
+        try:
+            with open(secret_file) as f:
+                secret = f.read().strip()
+        except FileNotFoundError:
+            sys.exit("no hub secret at %s — start the hub once on this machine "
+                      "first (it creates the secret on first run), then run "
+                      "`cod token` here." % secret_file)
+    exp = int(time.time()) + ttl
+    sig = hmac.new(secret.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    tok = base64.urlsafe_b64encode(("%d:%s" % (exp, sig)).encode()).decode()
+    print(tok)
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = argv[0]
+
+    if cmd == "health":
+        print(json.dumps(call("GET", "/cod/bus/health", timeout=10)))
+        return 0
+
+    if cmd == "token":
+        return cmd_token(argv[1:])
+
+    # --- optional transport: ssh/scp by NODE NAME ------------------------
+    # Only active if COD_MESH_DIR is set to a directory holding one
+    # sub-directory per node (each containing a `mesh.pub` once that node is
+    # keyed). The bus carries messages; ssh carries files and shells. If your
+    # ~/.ssh/config has a `Host <node>` block per node, the node name IS the
+    # ssh alias, and this just gives a clear error for unknown nodes.
+    if cmd in ("ssh", "scp", "nodes"):
+        import subprocess
+        mesh_cfg = cfg("COD_MESH_DIR", "")
+        if not mesh_cfg:
+            print("COD_MESH_DIR is not set; `cod %s` is an optional feature. "
+                  "See README." % cmd, file=sys.stderr)
+            return 2
+        mesh_dir = os.path.expanduser(mesh_cfg)
+        known = sorted(os.listdir(mesh_dir)) if os.path.isdir(mesh_dir) else []
+
+        if cmd == "nodes":
+            if not known:
+                print("no node registry at %s" % mesh_dir)
+                return 1
+            for n in known:
+                keyed = os.path.exists(os.path.join(mesh_dir, n, "mesh.pub"))
+                print("%-14s %s" % (n, "keyed" if keyed else "not keyed yet"))
+            return 0
+
+        if len(argv) < 2:
+            return print("usage: cod %s <node> ..." % cmd) or 2
+        if cmd == "scp":
+            cand = [a.split(":", 1)[0] for a in argv[1:] if ":" in a]
+            target = cand[0] if cand else None
+        else:
+            target = argv[1]
+        if known and target and target not in known:
+            print("'%s' is not a known node. known: %s" % (target, ", ".join(known)),
+                  file=sys.stderr)
+            return 2
+        if known and target and not os.path.exists(
+                os.path.join(mesh_dir, target, "mesh.pub")):
+            print("'%s' is registered but has no key yet." % target, file=sys.stderr)
+            return 2
+        return subprocess.call([cmd] + argv[1:])
+
+    if cmd == "send":
+        if len(argv) < 3:
+            return print("usage: cod send <to> <text...>") or 2
+        r = call("POST", "/cod/bus",
+                 {"from": NODE, "to": argv[1], "body": " ".join(argv[2:])}, timeout=20)
+        print("sent id=%s" % r.get("id"))
+        return 0
+
+    if cmd in ("recv", "listen"):
+        since = get_since()
+        wait = 0
+        if "--since" in argv:
+            since = int(argv[argv.index("--since") + 1])
+        if "--wait" in argv:
+            wait = int(argv[argv.index("--wait") + 1])
+        dspec = cfg("COD_BUS_DELIVER", "")
+        if "--deliver" in argv:
+            dspec = argv[argv.index("--deliver") + 1]
+        if cmd == "listen":
+            wait = max(wait, 25)
+        while True:
+            r = call("GET", "/cod/bus?since=%d&to=%s&wait=%d" % (since, NODE, wait),
+                     timeout=wait + 15)
+            for m in r.get("messages", []):
+                show(m)
+                if dspec:
+                    deliver(m, dspec)
+                since = max(since, m["id"])
+            set_since(since)
+            if cmd == "recv":
+                return 0
+            if not r.get("messages"):
+                time.sleep(1)
+
+    print("unknown command: %s" % cmd)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

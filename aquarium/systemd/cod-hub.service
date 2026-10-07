@@ -1,0 +1,22 @@
+# Install as a user unit:
+#   mkdir -p ~/.config/systemd/user
+#   cp cod-hub.service ~/.config/systemd/user/
+#   edit ExecStart to the real path of hub.py
+#   systemctl --user daemon-reload && systemctl --user enable --now cod-hub
+# To keep it running after logout: loginctl enable-linger $USER
+[Unit]
+Description=COD aquarium hub
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/cod/aquarium/hub.py
+Restart=always
+RestartSec=3
+# Loopback by default. Widen only if you mean to:
+# Environment=COD_BUS_BIND=0.0.0.0
+# Environment=COD_BUS_PORT=8798
+# Environment=COD_BUS_TMUX=agent
+
+[Install]
+WantedBy=default.target

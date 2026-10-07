@@ -1,0 +1,27 @@
+[Unit]
+Description=COD agents — resume every registered agent on this Pi
+After=network-online.target cod-tmux.service
+# The server must exist and be independently owned before any session is made.
+Requires=cod-tmux.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Agents belong to COD, not to the audio OS. One service per Pi, named for the
+# thing that owns it.
+#
+# start-all DISCOVERS agents from ~/.claude-persist/*.sid and resumes each on
+# its own pinned session id. Nothing here is hardcoded to a session name: a Pi
+# may run several agents and a reboot must bring back whatever was registered.
+#
+# THERE IS DELIBERATELY NO ExecStop.
+# On 2026-10-06 the old claude-rc.service had `ExecStop=claude-persist stop`.
+# It was Type=forking, so once start-all returned systemd saw nothing running,
+# marked the unit inactive, ran ExecStop, and killed the live agent and its
+# context. An agent-resume service must never be able to stop an agent. If you
+# add an ExecStop here you will reintroduce exactly that failure.
+ExecStart=%h/.local/bin/claude-persist start-all
+
+[Install]
+WantedBy=default.target
