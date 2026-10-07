@@ -35,6 +35,12 @@ DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
+    # --dormant is accepted as a NO-OP on purpose. Demiurge's install hook
+    # passes it to say "install but join nothing" — which is the only thing
+    # this script ever does. Rejecting it aborted every Demiurge install at
+    # Phase 12 with 'unknown arg: --dormant'. The flag states an intent that
+    # is already guaranteed, so honour it rather than fail on it.
+    --dormant) : ;;
     --repo) REPO="${2:?--repo needs a url}"; shift ;;
     --ref)  REF="${2:?--ref needs a ref}"; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
