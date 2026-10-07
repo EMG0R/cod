@@ -40,8 +40,13 @@ resolve_claude() {
 
 say() { printf '%s\n' "$*"; }
 cmd="${1:-attach}"
+case "$cmd" in -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;; esac
 case "$cmd" in attach|stream|start|start-all|stop|status|reset|list|restart|fresh|_loop) shift ;; *) cmd=attach ;; esac
 N="${1:-claude}"
+# Reject anything flag-shaped as a name. `claude-persist --help` previously
+# fell through to the name slot and REGISTERED an agent called "--help" with a
+# cwd of ~/--help. A typo must not create an agent.
+case "$N" in -*) echo "not an agent name: $N (did you mean a subcommand?)" >&2; exit 2 ;; esac
 [[ "$N" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad name: $N" >&2; exit 2; }
 
 cwd_for() {  # remembered per instance; first start fixes it
@@ -69,7 +74,7 @@ run_loop() {
       # it announces itself. Override per agent in $D/$N.resumeprompt.
       rp="$(cat "$D/$N.resumeprompt" 2>/dev/null)"
       [ -n "$rp" ] || rp="You just came back from a restart with your context intact. Briefly: confirm what this node is and that its services are up, announce yourself on the bus if this node is in a tank, then carry on with whatever you were doing."
-      $(resolve_claude) --rc --resume "$sid" -n "$N" "$rp"
+      $(resolve_claude) --rc --resume "$sid" -n "$(cat "$D/$N.title" 2>/dev/null || echo "$N")" "$rp"
     else
       echo "[claude-persist:$N] new session $sid"
       # A fresh agent with no opening prompt is a dead agent: it sits at the
@@ -79,7 +84,7 @@ run_loop() {
       # survivable. Override per instance in $D/$N.bootprompt.
       bp="$(cat "$D/$N.bootprompt" 2>/dev/null)"
       [ -n "$bp" ] || bp="You are the $N agent on this node, waking with no prior context after a restart or a deliberate context roll. Before acting: read any handoff notes left for you on this machine, say plainly what you are and what this node is for, and ask for what you need rather than guessing. Do not assume you have credentials, network peers, or private data; this node may be a clean public install."
-      $(resolve_claude) --rc --session-id "$sid" -n "$N" "$bp"
+      $(resolve_claude) --rc --session-id "$sid" -n "$(cat "$D/$N.title" 2>/dev/null || echo "$N")" "$bp"
     fi
     echo "[claude-persist:$N] claude exited, restarting in 5s"; sleep 5
   done
@@ -148,7 +153,29 @@ case "$cmd" in
   start)  ensure ;;
   stop)   tmux kill-session -t "$N" 2>/dev/null ;;
   status) tmux has-session -t "$N" 2>/dev/null && { echo "$N running (sid $(cat "$D/$N.sid" 2>/dev/null))"; tmux capture-pane -pt "$N" | grep -v "^ *$" | tail -5; } || echo "$N stopped" ;;
-  list)   for f in "$D"/*.sid; do [ -e "$f" ] || continue; n=$(basename "$f" .sid); [ "$n" = _cod_hold ] && continue; printf '%s\t%s\t%s\t%s\n' "$n" "$(tmux has-session -t "$n" 2>/dev/null && echo running || echo stopped)" "$(cat "$D/$n.cwd" 2>/dev/null)" "$(cat "$f")"; done ;;
+  # list — STABLE column order, documented, same on every node:
+  #   name <TAB> state <TAB> activity <TAB> cwd <TAB> session-id <TAB> display
+  # `activity` is active|idle: idle means the transcript contains no user turns,
+  # i.e. nobody has ever typed into this agent. A viewer (the COD app) streams
+  # only active ones, otherwise every freshly-registered agent becomes an empty
+  # window. Columns were previously ordered differently on different nodes,
+  # which forced consumers to guess by shape; don't reorder these again.
+  list)
+    for f in "$D"/*.sid; do
+      [ -e "$f" ] || continue
+      n=$(basename "$f" .sid); [ "$n" = _cod_hold ] && continue
+      sid=$(cat "$f" 2>/dev/null)
+      st=$(tmux has-session -t "$n" 2>/dev/null && echo running || echo stopped)
+      cw=$(cat "$D/$n.cwd" 2>/dev/null)
+      dn=$(cat "$D/$n.title" 2>/dev/null); [ -n "$dn" ] || dn="$n"
+      act=idle
+      for t in "$HOME"/.claude/projects/*/"$sid".jsonl; do
+        [ -e "$t" ] || continue
+        grep -qm1 '"type":"user"' "$t" 2>/dev/null && act=active
+        break
+      done
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$act" "$cw" "$sid" "$dn"
+    done ;;
   reset)  rm -f "$D/$N.sid" ;;
   # restart — bounce ONLY the inner claude, never the tmux session. Killing the
   # session would drop the agent the Claude app is remote-controlling. The sid
