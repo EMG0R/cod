@@ -76,7 +76,7 @@ A="$SRC/cod/aquarium"
 
 # Verify before installing, so a bad checkout fails here rather than halfway.
 if [ "$DRY" = 0 ]; then
-  for f in cod agents/claude-persist agents/systemd/cod-tmux.service agents/systemd/cod-agents.service; do
+  for f in cod agents/claude-persist agents/systemd/cod-tmux.service agents/systemd/cod-agents.service agents/systemd/cod-listen.service; do
     [ -f "$A/$f" ] || die "checkout is missing aquarium/$f — wrong ref, or the repo layout moved"
   done
   python3 -m py_compile "$A/cod" || die "aquarium/cod does not compile; refusing to install it"
@@ -92,8 +92,9 @@ if [ "$DRY" = 0 ]; then
   install -m 0755 "$A/agents/claude-persist"  "$BIN/claude-persist"
   install -m 0644 "$A/agents/systemd/cod-tmux.service"   "$UNITS/cod-tmux.service"
   install -m 0644 "$A/agents/systemd/cod-agents.service" "$UNITS/cod-agents.service"
+  install -m 0644 "$A/agents/systemd/cod-listen.service"  "$UNITS/cod-listen.service"
 else
-  say "  would: install cod, claude-persist, cod-tmux.service, cod-agents.service"
+  say "  would: install cod, claude-persist, cod-tmux.service, cod-agents.service, cod-listen.service"
 fi
 say "installed client + agent layer"
 
@@ -101,7 +102,7 @@ say "installed client + agent layer"
 # Enabling is safe: with no registered agents and no ~/.cod-bus.conf, these
 # units come up and do nothing. That is the dormant state we want.
 run systemctl --user daemon-reload
-run systemctl --user enable cod-tmux.service cod-agents.service
+run systemctl --user enable cod-tmux.service cod-agents.service cod-listen.service
 if ! loginctl show-user "$USER" -p Linger --value 2>/dev/null | grep -q yes; then
   say "enabling linger (without it the user manager stops at logout and agents die)"
   run sudo loginctl enable-linger "$USER" || say "WARNING: could not enable linger; agents will not survive logout"
@@ -115,11 +116,12 @@ say "done — this node is DORMANT and ready, holding no credentials."
 say ""
 say "  cod client      : $BIN/cod"
 say "  agent layer     : $BIN/claude-persist"
-say "  units enabled   : cod-tmux.service, cod-agents.service"
+say "  units enabled   : cod-tmux.service, cod-agents.service, cod-listen.service"
 say "  tank membership : none (no ~/.cod-bus.conf, no token) — by design"
 say ""
 say "Next, as separate human-authorised steps:"
 say "  1. join the tailnet   (operator-supplied key; never baked in)"
 say "  2. get a bus token    (node-side, from the gate; never via a laptop)"
 say "  3. write ~/.cod-bus.conf with COD_BUS_URL / COD_BUS_NODE / COD_BUS_TOKEN"
+say "     (add COD_BUS_DELIVER=tmux:<session> so cod-listen delivers into the agent)"
 say "  4. register an agent  (claude-persist start <name>) once Claude is logged in"
