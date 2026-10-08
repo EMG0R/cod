@@ -1,0 +1,39 @@
+[Unit]
+# cod-listen — deliver bus messages into this node's agent session, from boot.
+#
+# WHY Restart=always IS THE WHOLE POINT.
+# `cod`'s call() does sys.exit() on any network error, so the listener dies
+# immediately if the hub is unreachable. At boot that is the NORMAL case: on a
+# tailnet node the hub stays unreachable for roughly the first minute while
+# tailscale establishes peers. A one-shot listener therefore always loses the
+# race, which is why this kept being started by hand afterwards.
+#
+# Messages are durable on the hub, so dying and retrying loses nothing — the
+# listener resumes from its own cursor. Restart until the hub answers.
+#
+# No ExecStop, deliberately: stop actions on units in this family have twice
+# torn down more than the unit owned, taking the agent's tmux server with them.
+Description=COD bus listener (delivers into the agent session)
+# Rate limiting lives in [Unit], not [Service] — systemd ignores it in [Service]
+# and says so in the journal. It must be off here: the boot-time retries this
+# unit exists for would otherwise trip the default 5-starts-in-10s limit and the
+# listener would be given up on exactly when it is needed.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+Requires=cod-tmux.service
+After=cod-tmux.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The delivery target is NOT hardcoded here. `cod` reads COD_BUS_DELIVER from
+# the node's own ~/.cod-bus.conf (e.g. COD_BUS_DELIVER=tmux:claude), so one unit
+# serves every node whatever its session is called.
+ExecStart=%h/.local/bin/cod listen
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
