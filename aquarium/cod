@@ -7,6 +7,13 @@
   cod recv [--since N] [--wait S] read messages addressed to this node
   cod listen                      long-poll forever, print as they arrive
   cod health                      is the hub up
+  cod inbox [--node X] [--since N] [--json]   unread for this node
+  cod ack [--node X] [--up-to N]  mark read (default: newest seen by `inbox`)
+  cod townhall [--since N] [--json]           read the room
+  cod meet convene <topic> [--with a,b,c]     start a meeting, prints its id
+  cod meet say <id> <text...>     speak in a meeting
+  cod meet close <id> [--summary "..."]       close it (closed = read-only)
+  cod meet show <id> | list       transcript / index of meetings
   cod nodes|ssh|scp               optional, need COD_MESH_DIR (see README)
 
 Config, in order of precedence: flags, env, ~/.cod-bus.conf (ini-less, k=v).
@@ -18,7 +25,8 @@ Config, in order of precedence: flags, env, ~/.cod-bus.conf (ini-less, k=v).
 A state file ~/.cod-bus.since remembers where you were, so `recv` and `listen`
 do not replay what you already read.
 """
-import base64, hashlib, hmac, json, os, sys, time, urllib.error, urllib.request
+import base64, hashlib, hmac, json, os, signal, sys, time, urllib.error, urllib.request
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 CONF = os.path.expanduser("~/.cod-bus.conf")
 SINCE_FILE = os.path.expanduser(os.environ.get("COD_BUS_STATE", "~/.cod-bus.since"))
@@ -45,7 +53,7 @@ TOKEN = cfg("COD_BUS_TOKEN", "")
 NODE = cfg("COD_BUS_NODE", os.uname().nodename)
 
 
-def call(method, path, body=None, timeout=60):
+def call(method, path, body=None, timeout=60, conflict=None):
     req = urllib.request.Request(URL + path, method=method)
     if TOKEN:
         req.add_header("Authorization", "Bearer " + TOKEN)
@@ -58,6 +66,8 @@ def call(method, path, body=None, timeout=60):
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         detail = e.read().decode()[:200]
+        if e.code == 409 and conflict:
+            sys.exit(conflict)
         if e.code == 401:
             sys.exit("401 — bad or expired token. Set COD_BUS_TOKEN (see `cod token`).")
         sys.exit("HTTP %s: %s" % (e.code, detail))
@@ -77,6 +87,137 @@ def set_since(n):
         open(SINCE_FILE, "w").write(str(n))
     except Exception:
         pass
+
+
+INBOX_FILE = os.path.expanduser(os.environ.get("COD_BUS_INBOX_STATE", "~/.cod-bus.inbox"))
+
+
+def opt(argv, flag, default=None):
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else default
+
+
+def tstr(ts, full=False):
+    return time.strftime("%Y-%m-%d %H:%M:%S" if full else "%H:%M:%S", time.localtime(ts or 0))
+
+
+def cmd_inbox(argv):
+    node = opt(argv, "--node", NODE)
+    q = "/cod/inbox?node=%s" % node
+    if opt(argv, "--since") is not None:
+        q += "&since=%d" % int(opt(argv, "--since"))
+    r = call("GET", q, timeout=20)
+    try:
+        with open(INBOX_FILE, "w") as f:
+            json.dump({"node": node, "last": r.get("last", 0)}, f)
+    except Exception:
+        pass
+    if "--json" in argv:
+        print(json.dumps(r))
+        return 0
+    print("%s: %s unread (cursor %s, last %s)" % (node, r.get("unread", 0),
+                                                  r.get("cursor"), r.get("last")))
+    for m in r.get("messages", []):
+        print("#%s [%s] %s -> %s: %s" % (m.get("id"), tstr(m.get("ts")),
+                                         m.get("from"), m.get("to"), m.get("body")))
+    return 0
+
+
+def cmd_ack(argv):
+    node = opt(argv, "--node", NODE)
+    up_to = opt(argv, "--up-to")
+    if up_to is not None:
+        up_to = int(up_to)
+    else:
+        try:
+            st = json.load(open(INBOX_FILE))
+            if st.get("node") == node:
+                up_to = int(st["last"])
+        except Exception:
+            pass
+        if up_to is None:
+            up_to = int(call("GET", "/cod/inbox?node=%s" % node, timeout=20).get("last", 0))
+    r = call("POST", "/cod/inbox/ack", {"node": node, "up_to": up_to}, timeout=20)
+    print("acked %s up to #%s (cursor now %s)" % (node, up_to, r.get("cursor")))
+    return 0
+
+
+def cmd_townhall(argv):
+    q = "/cod/townhall"
+    if opt(argv, "--since") is not None:
+        q += "?since=%d" % int(opt(argv, "--since"))
+    r = call("GET", q, timeout=20)
+    if "--json" in argv:
+        print(json.dumps(r))
+        return 0
+    print("%s: %s messages (last %s)" % (r.get("room", "townhall"), r.get("count"), r.get("last")))
+    for m in r.get("messages", []):
+        print("#%s [%s] %s: %s" % (m.get("id"), tstr(m.get("ts")), m.get("from"), m.get("body")))
+    return 0
+
+
+def cmd_meet(argv):
+    sub = argv[0] if argv else ""
+    rest = argv[1:]
+    if sub == "list":
+        ms = call("GET", "/cod/meetings", timeout=20).get("meetings", [])
+        if not ms:
+            print("no meetings")
+        for m in ms:
+            print("%-44s %-6s %3s msgs  by %s  %s" % (
+                m["meeting"], "closed" if m.get("closed") else "open",
+                m.get("messages", 0), m.get("convened_by", "?"), m.get("topic", "")))
+        return 0
+    if sub == "convene":
+        words, i = [], 0
+        while i < len(rest):
+            if rest[i] == "--with":
+                i += 2
+                continue
+            words.append(rest[i])
+            i += 1
+        topic = " ".join(words).strip()
+        if not topic:
+            return print("usage: cod meet convene <topic> [--with a,b,c]") or 2
+        parts = [p for p in (opt(rest, "--with", "") or "").split(",") if p]
+        r = call("POST", "/cod/meeting/convene",
+                 {"topic": topic, "by": NODE, "participants": parts}, timeout=20)
+        print(r.get("meeting"))
+        return 0
+    if sub in ("say", "close", "show") and not rest:
+        return print("usage: cod meet %s <id> ..." % sub) or 2
+    if sub == "say":
+        if len(rest) < 2:
+            return print("usage: cod meet say <id> <text...>") or 2
+        mid = rest[0]
+        call("POST", "/cod/meeting/say", {"meeting": mid, "from": NODE, "body": " ".join(rest[1:])},
+             timeout=20, conflict="meeting %s is closed" % mid)
+        print("said in %s" % mid)
+        return 0
+    if sub == "close":
+        mid = rest[0]
+        summ = opt(rest, "--summary", "")
+        call("POST", "/cod/meeting/close", {"meeting": mid, "by": NODE, "summary": summ},
+             timeout=20, conflict="meeting %s is closed" % mid)
+        print("closed %s" % mid)
+        return 0
+    if sub == "show":
+        r = call("GET", "/cod/meeting/%s" % rest[0], timeout=20)
+        for x in r.get("records", []):
+            k, t = x.get("kind"), tstr(x.get("ts"))
+            if k == "convene":
+                print("== %s  (%s)\n   convened by %s %s at %s" % (
+                    x.get("topic"), r.get("meeting"), x.get("by"),
+                    ("with " + ", ".join(x["participants"])) if x.get("participants") else "",
+                    tstr(x.get("ts"), True)))
+            elif k == "say":
+                print("[%s] %s: %s" % (t, x.get("from"), x.get("body")))
+            elif k == "close":
+                print("== closed by %s at %s" % (x.get("by"), tstr(x.get("ts"), True)))
+                if x.get("summary"):
+                    print("   summary: %s" % x["summary"])
+        return 0
+    print("usage: cod meet convene|say|close|show|list ...")
+    return 2
 
 
 def show(m):
@@ -159,6 +300,15 @@ def main(argv):
 
     if cmd == "token":
         return cmd_token(argv[1:])
+
+    if cmd == "inbox":
+        return cmd_inbox(argv[1:])
+    if cmd == "ack":
+        return cmd_ack(argv[1:])
+    if cmd == "townhall":
+        return cmd_townhall(argv[1:])
+    if cmd == "meet":
+        return cmd_meet(argv[1:])
 
     # --- optional transport: ssh/scp by NODE NAME ------------------------
     # Only active if COD_MESH_DIR is set to a directory holding one
