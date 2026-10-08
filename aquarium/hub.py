@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aquarium hub — node-to-node messaging, hub-mediated.
+"""cod-bus hub — node-to-node messaging, hub-mediated.
 
 Auth, standalone by default:
   On first run this generates a random secret at COD_HUB_SECRET_FILE
@@ -171,9 +171,105 @@ def _deliver(msg):
         pass
 
 
+
+# ---------------------------------------------------------------------------
+# INBOXES, TOWN HALL, MEETINGS
+#
+# The flat log stays exactly as it is — 193 messages of real history, and every
+# existing endpoint keeps working. This adds structure ON TOP of it.
+#
+# Three things the flat log could not do:
+#   1. PRIVATE INBOX with read state the HUB owns. Read position used to live in
+#      each node's ~/.cod-bus.since, so reimaging a node lost it and nobody
+#      could tell what an agent had actually seen. Cursors now live here.
+#   2. TOWN HALL as a durable ROOM, not a broadcast. `to: all` pushes a message
+#      at everyone once; `to: townhall` is a place you can come back and read.
+#      80 of 193 messages were already broadcast, so the room exists whether or
+#      not we modelled it.
+#   3. MEETINGS: a convened, topic'd thread with participants and a transcript,
+#      so "we agreed X" has a record instead of living in someone's context.
+# ---------------------------------------------------------------------------
+TOWNHALL = "townhall"
+CURSOR_DIR = os.path.join(os.path.dirname(STORE), "read")
+MEET_DIR = os.path.join(os.path.dirname(STORE), "meetings")
+
+
+def _cursor_path(node):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", node)[:64]
+    return os.path.join(CURSOR_DIR, safe)
+
+
+def get_cursor(node):
+    try:
+        with open(_cursor_path(node)) as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+
+def set_cursor(node, upto):
+    os.makedirs(CURSOR_DIR, exist_ok=True)
+    tmp = _cursor_path(node) + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(int(upto)))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _cursor_path(node))
+
+
+def _meet_path(mid):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", mid)[:80]
+    return os.path.join(MEET_DIR, safe + ".jsonl")
+
+
+def meeting_append(mid, rec):
+    os.makedirs(MEET_DIR, exist_ok=True)
+    with open(_meet_path(mid), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def meeting_read(mid):
+    out = []
+    try:
+        with open(_meet_path(mid)) as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def meetings_list():
+    try:
+        names = sorted(n[:-6] for n in os.listdir(MEET_DIR) if n.endswith(".jsonl"))
+    except FileNotFoundError:
+        return []
+    out = []
+    for n in names:
+        recs = meeting_read(n)
+        if not recs:
+            continue
+        head = recs[0]
+        out.append({
+            "meeting": n,
+            "topic": head.get("topic", ""),
+            "convened_by": head.get("by", ""),
+            "participants": head.get("participants", []),
+            "messages": sum(1 for r in recs if r.get("kind") == "say"),
+            "closed": any(r.get("kind") == "close" for r in recs),
+            "ts": head.get("ts"),
+        })
+    return out
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "cod-hub"
+    server_version = "cod-bus"
 
     def log_message(self, *a):
         pass
@@ -204,6 +300,47 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/cod/bus/health":
             return self._send(200, {"ok": True, "node": SELF_NODE})
+        # private inbox: what has THIS node not seen, by the hub's reckoning
+        if u.path == "/cod/inbox":
+            if not self._auth(q):
+                return
+            node = (q.get("node") or [None])[0]
+            if not node:
+                return self._send(400, {"error": "need ?node="})
+            cur = get_cursor(node)
+            since = int((q.get("since") or [cur])[0] or 0)
+            msgs = _read_since(since, node)
+            with _lock:
+                last = _count
+            return self._send(200, {"node": node, "cursor": cur, "last": last,
+                                    "unread": len(msgs), "messages": msgs})
+
+        # town hall: a durable room, readable by anyone, not a one-shot push
+        if u.path == "/cod/townhall":
+            if not self._auth(q):
+                return
+            since = int((q.get("since") or ["0"])[0] or 0)
+            msgs = [m for m in _read_since(since)
+                    if m.get("to") in (TOWNHALL, "all", "*")]
+            with _lock:
+                last = _count
+            return self._send(200, {"room": TOWNHALL, "last": last,
+                                    "count": len(msgs), "messages": msgs})
+
+        if u.path == "/cod/meetings":
+            if not self._auth(q):
+                return
+            return self._send(200, {"meetings": meetings_list()})
+
+        if u.path.startswith("/cod/meeting/"):
+            if not self._auth(q):
+                return
+            mid = u.path[len("/cod/meeting/"):]
+            recs = meeting_read(mid)
+            if not recs:
+                return self._send(404, {"error": "no such meeting"})
+            return self._send(200, {"meeting": mid, "records": recs})
+
         if u.path != "/cod/bus":
             return self._send(404, {"error": "not found"})
         if not self._auth(q):
@@ -225,6 +362,68 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         global _count
         u = urlparse(self.path)
+        if u.path in ("/cod/inbox/ack", "/cod/meeting/convene",
+                      "/cod/meeting/say", "/cod/meeting/close"):
+            if not self._auth(parse_qs(u.query)):
+                return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = 0
+            if n <= 0 or n > MAX_BODY:
+                return self._send(400, {"error": "bad body length"})
+            try:
+                d = json.loads(self.rfile.read(n).decode())
+            except Exception:
+                return self._send(400, {"error": "bad json"})
+            if not isinstance(d, dict):
+                return self._send(400, {"error": "need an object"})
+
+            if u.path == "/cod/inbox/ack":
+                node = d.get("node"); upto = d.get("up_to")
+                if not node or upto is None:
+                    return self._send(400, {"error": "need {node, up_to}"})
+                set_cursor(node, upto)
+                return self._send(200, {"ok": True, "node": node,
+                                        "cursor": get_cursor(node)})
+
+            if u.path == "/cod/meeting/convene":
+                topic = (d.get("topic") or "").strip()
+                by = d.get("by") or "unknown"
+                parts = d.get("participants") or []
+                if not topic:
+                    return self._send(400, {"error": "need {topic}"})
+                mid = time.strftime("%Y%m%d-%H%M%S") + "-" + \
+                      re.sub(r"[^a-z0-9]+", "-", topic.lower())[:40].strip("-")
+                meeting_append(mid, {"kind": "convene", "topic": topic, "by": by,
+                                     "participants": parts, "ts": time.time()})
+                return self._send(200, {"ok": True, "meeting": mid, "topic": topic})
+
+            if u.path == "/cod/meeting/say":
+                mid = d.get("meeting"); body = d.get("body")
+                if not mid or not body:
+                    return self._send(400, {"error": "need {meeting, body}"})
+                recs = meeting_read(mid)
+                if not recs:
+                    return self._send(404, {"error": "no such meeting"})
+                if any(r.get("kind") == "close" for r in recs):
+                    return self._send(409, {"error": "meeting is closed"})
+                meeting_append(mid, {"kind": "say", "from": d.get("from") or "unknown",
+                                     "body": str(body)[:MAX_BODY], "ts": time.time()})
+                return self._send(200, {"ok": True, "meeting": mid})
+
+            if u.path == "/cod/meeting/close":
+                mid = d.get("meeting")
+                recs = meeting_read(mid) if mid else []
+                if not recs:
+                    return self._send(404, {"error": "no such meeting"})
+                if any(r.get("kind") == "close" for r in recs):
+                    return self._send(409, {"error": "already closed"})
+                meeting_append(mid, {"kind": "close", "by": d.get("by") or "unknown",
+                                     "summary": str(d.get("summary") or "")[:MAX_BODY],
+                                     "ts": time.time()})
+                return self._send(200, {"ok": True, "meeting": mid, "closed": True})
+
         if u.path != "/cod/bus":
             return self._send(404, {"error": "not found"})
         if not self._auth(parse_qs(u.query)):
@@ -265,5 +464,5 @@ if __name__ == "__main__":
     _load_count()
     srv = ThreadingHTTPServer((BIND, PORT), H)
     srv.daemon_threads = True
-    print("aquarium hub on %s:%d as %s (%d messages)" % (BIND, PORT, SELF_NODE, _count), flush=True)
+    print("cod-bus on %s:%d as %s (%d messages)" % (BIND, PORT, SELF_NODE, _count), flush=True)
     srv.serve_forever()
