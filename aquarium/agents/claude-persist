@@ -175,7 +175,21 @@ for f in glob.glob(os.path.expanduser('~/.claude/sessions/*.json')):
     except Exception: continue                      # not alive
     tm = (d.get('tmux') or '').split(':')[0]
     ok = re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', tm or '') and tm != '_cod_hold'
-    name = tm if ok else 'claude-' + sid[:8]
+    # AN AGENT IS A `claude --rc` LIVING IN TMUX. A live interactive session with
+    # NO tmux is something else, and there is nothing to bring it back TO.
+    #
+    # This used to fall through to name = 'claude-<sid8>' and register it anyway.
+    # The SPEAK chat server's warm_brain pool is exactly that shape: it spawns
+    # `claude -p --input-format stream-json` workers which write interactive
+    # session files with no tmux. snapshot adopted four of them as agents named
+    # claude-1602a4a1 and friends, and start-all then tried to resurrect each one
+    # as a real tmux --rc agent at every boot — four ~180 MB processes with no
+    # boot prompt, cwd ~/SPEAK, doing nothing, reappearing every 2 minutes
+    # because the chat server keeps spawning fresh pool workers.
+    #
+    # Skip them. The chat server owns its own pool's lifecycle.
+    if not ok: continue
+    name = tm
     title = (d.get('name') or name).replace('\t', ' ').replace('\n', ' ')
     cwd = (d.get('cwd') or os.path.expanduser('~')).replace('\t', ' ').replace('\n', ' ')
     open(os.path.join(out, name), 'w').write(f"{sid}\t{cwd}\t{title}\n")
