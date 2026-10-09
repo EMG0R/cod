@@ -179,15 +179,14 @@ for f in glob.glob(os.path.expanduser('~/.claude/sessions/*.json')):
     # NO tmux is something else, and there is nothing to bring it back TO.
     #
     # This used to fall through to name = 'claude-<sid8>' and register it anyway.
-    # The SPEAK chat server's warm_brain pool is exactly that shape: it spawns
-    # `claude -p --input-format stream-json` workers which write interactive
-    # session files with no tmux. snapshot adopted four of them as agents named
-    # claude-1602a4a1 and friends, and start-all then tried to resurrect each one
-    # as a real tmux --rc agent at every boot — four ~180 MB processes with no
-    # boot prompt, cwd ~/SPEAK, doing nothing, reappearing every 2 minutes
-    # because the chat server keeps spawning fresh pool workers.
+    # Any service that keeps a POOL of `claude -p --input-format stream-json`
+    # workers is exactly that shape: the workers write interactive session files
+    # with no tmux. snapshot adopted four of them as agents, and start-all then
+    # tried to resurrect each one as a real tmux --rc agent at every boot — four
+    # ~180 MB processes with no boot prompt, doing nothing, and reappearing
+    # within minutes because the owning service keeps spawning fresh workers.
     #
-    # Skip them. The chat server owns its own pool's lifecycle.
+    # Skip them. A service that pools its own workers owns their lifecycle.
     if not ok: continue
     name = tm
     title = (d.get('name') or name).replace('\t', ' ').replace('\n', ' ')
